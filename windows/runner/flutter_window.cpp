@@ -153,6 +153,10 @@ bool FlutterWindow::OnCreate() {
     return false;
   }
 
+  // Let Explorer's taskbar messages through when Plezy runs elevated (UIPI blocks them otherwise).
+  ::ChangeWindowMessageFilterEx(GetHandle(), taskbar_button_created_message_, MSGFLT_ALLOW, nullptr);
+  ::ChangeWindowMessageFilterEx(GetHandle(), WM_COMMAND, MSGFLT_ALLOW, nullptr);
+
   RECT frame = GetClientArea();
 
   // The size here must match the window dimensions to avoid unnecessary surface
