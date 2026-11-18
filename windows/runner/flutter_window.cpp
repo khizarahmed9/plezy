@@ -5,9 +5,13 @@
 #include "flutter/generated_plugin_registrant.h"
 #include "mpv/display_mode_manager.h"
 #include "mpv/mpv_plugin.h"
+#include "resource.h"
 
 static constexpr wchar_t kWindowPlacementKey[] = L"Software\\Plezy";
 static constexpr wchar_t kWindowPlacementValue[] = L"WindowPlacement";
+
+// Taskbar thumbnail button ids, reported back in WM_COMMAND's LOWORD.
+enum ThumbButtonId : UINT { kThumbPrevious = 1, kThumbPlayPause, kThumbNext };
 
 static UINT_PTR g_saveTimerId = 0;
 static HWND g_mainHwnd = nullptr;
@@ -198,6 +202,7 @@ void FlutterWindow::OnDestroy() {
   }
 
   window_channel_ = nullptr;
+  taskbar_.Reset();
 
   if (flutter_controller_) {
     flutter_controller_ = nullptr;
@@ -216,7 +221,42 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message, WPARAM const wparam
     }
   }
 
+  if (message == taskbar_button_created_message_) {
+    // Also re-sent when Explorer restarts; the new taskbar needs the buttons
+    // added again.
+    if (SUCCEEDED(
+            ::CoCreateInstance(
+                CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(taskbar_.ReleaseAndGetAddressOf()))) &&
+        SUCCEEDED(taskbar_->HrInit())) {
+      ApplyThumbButtons(true);
+    } else {
+      taskbar_.Reset();
+    }
+    return 0;
+  }
+
   switch (message) {
+    case WM_COMMAND:
+      if (HIWORD(wparam) == THBN_CLICKED && window_channel_) {
+        const char* button = nullptr;
+        switch (LOWORD(wparam)) {
+          case kThumbPrevious:
+            button = "previous";
+            break;
+          case kThumbPlayPause:
+            button = "playPause";
+            break;
+          case kThumbNext:
+            button = "next";
+            break;
+        }
+        if (button) {
+          window_channel_->InvokeMethod(
+              "onThumbButton", std::make_unique<flutter::EncodableValue>(std::string(button)));
+          return 0;
+        }
+      }
+      break;
     case WM_DISPLAYCHANGE:
       // One bounded, serialized retry for a display that may have reconnected.
       mpv::DisplayModeManager::RecoverIfNeeded();
@@ -283,10 +323,63 @@ void FlutterWindow::RegisterWindowChannel() {
       }
       SetDarkMode(*dark);
       result->Success();
+    } else if (name == "setThumbButtons") {
+      const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+      if (args == nullptr) {
+        result->Error("invalid_arguments", "setThumbButtons expects a map");
+        return;
+      }
+      auto flag = [args](const char* key) -> std::optional<bool> {
+        auto it = args->find(flutter::EncodableValue(key));
+        if (it == args->end()) return std::nullopt;
+        if (const bool* b = std::get_if<bool>(&it->second)) return *b;
+        return std::nullopt;
+      };
+      thumb_playing_ = flag("playing");
+      thumb_can_play_pause_ = flag("canPlayPause").value_or(false);
+      thumb_can_previous_ = flag("canPrevious").value_or(false);
+      thumb_can_next_ = flag("canNext").value_or(false);
+      ApplyThumbButtons(false);
+      result->Success();
     } else {
       result->NotImplemented();
     }
   });
+}
+
+void FlutterWindow::ApplyThumbButtons(bool add) {
+  if (!taskbar_) return;
+
+  const bool visible = thumb_playing_.has_value();
+  const bool playing = thumb_playing_.value_or(false);
+  const struct {
+    UINT id;
+    int icon;
+    const wchar_t* tip;
+    bool enabled;
+  } specs[] = {
+      {kThumbPrevious, IDI_THUMB_PREVIOUS, L"Previous", thumb_can_previous_},
+      {kThumbPlayPause, playing ? IDI_THUMB_PAUSE : IDI_THUMB_PLAY, playing ? L"Pause" : L"Play",
+       thumb_can_play_pause_},
+      {kThumbNext, IDI_THUMB_NEXT, L"Next", thumb_can_next_},
+  };
+
+  const int icon_size = ::GetSystemMetrics(SM_CXSMICON);
+  THUMBBUTTON buttons[3] = {};
+  for (size_t i = 0; i < 3; ++i) {
+    buttons[i].dwMask = THB_ICON | THB_TOOLTIP | THB_FLAGS;
+    buttons[i].iId = specs[i].id;
+    // LR_SHARED: the system owns and caches the icon, so it is never destroyed here.
+    buttons[i].hIcon = static_cast<HICON>(::LoadImageW(
+        ::GetModuleHandleW(nullptr), MAKEINTRESOURCEW(specs[i].icon), IMAGE_ICON, icon_size, icon_size, LR_SHARED));
+    wcscpy_s(buttons[i].szTip, specs[i].tip);
+    buttons[i].dwFlags = !visible ? THBF_HIDDEN : (specs[i].enabled ? THBF_ENABLED : THBF_DISABLED);
+  }
+
+  HWND hwnd = GetHandle();
+  const HRESULT hr =
+      add ? taskbar_->ThumbBarAddButtons(hwnd, 3, buttons) : taskbar_->ThumbBarUpdateButtons(hwnd, 3, buttons);
+  if (FAILED(hr) && add) taskbar_.Reset();
 }
 
 void FlutterWindow::NotifyFullScreenChanged() {
