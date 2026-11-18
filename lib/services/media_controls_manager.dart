@@ -12,6 +12,7 @@ import '../media/media_item_types.dart';
 import '../media/media_kind.dart';
 import '../utils/app_logger.dart';
 import 'image_cache_service.dart';
+import 'native_window_service.dart';
 
 /// Manages OS media controls integration for video playback.
 ///
@@ -21,7 +22,16 @@ import 'image_cache_service.dart';
 /// - Control event streaming (play, pause, next, previous, seek)
 /// - Position update throttling to prevent excessive API calls
 class MediaControlsManager {
-  Stream<MediaControlEvent> get controlEvents => OsMediaControls.controlEvents;
+  /// OS session events, plus the Windows taskbar thumbnail buttons.
+  Stream<MediaControlEvent> get controlEvents => defaultTargetPlatform == TargetPlatform.windows
+      ? Stream.multi((controller) {
+          final subs = [
+            OsMediaControls.controlEvents.listen(controller.add, onError: controller.addError),
+            NativeWindowService.thumbButtonEvents.listen(controller.add),
+          ];
+          controller.onCancel = () => Future.wait(subs.map((s) => s.cancel()));
+        })
+      : OsMediaControls.controlEvents;
 
   /// Throttled playback state update (1 second interval, leading + trailing)
   late final Throttle _throttledUpdate;
@@ -36,6 +46,14 @@ class MediaControlsManager {
   bool? _lastCanSetSpeed;
   Duration? _lastSkipInterval;
   bool _updatesSuspended = false;
+
+  /// Windows taskbar thumbnail buttons mirror the session state sent to the
+  /// OS controls. [_thumbPlaying] null means nothing is playing.
+  bool? _thumbPlaying;
+  bool _thumbCanPlayPause = false;
+  bool _thumbCanPrevious = false;
+  bool _thumbCanNext = false;
+  Object? _lastThumbState;
 
   /// Bumped by every metadata update and [clear], so artwork bytes that
   /// arrive late never land on a newer item or a cleared session.
@@ -129,6 +147,8 @@ class MediaControlsManager {
     bool force = false,
   }) async {
     if (_updatesSuspended) return;
+    _thumbPlaying = isPlaying;
+    unawaited(_syncThumbButtons());
 
     final params = _PlaybackStateParams(isPlaying: isPlaying, position: position, speed: speed);
 
@@ -187,6 +207,10 @@ class MediaControlsManager {
     Duration? skipInterval,
   }) async {
     if (_updatesSuspended) return;
+    _thumbCanPlayPause = canPlayPause;
+    _thumbCanPrevious = canGoPrevious;
+    _thumbCanNext = canGoNext;
+    unawaited(_syncThumbButtons());
 
     final isDarwin = defaultTargetPlatform == TargetPlatform.iOS || defaultTargetPlatform == TargetPlatform.macOS;
     final effectiveCanSkip = canSkip && (!isDarwin || preferSkipOverTrackButtons);
@@ -273,6 +297,9 @@ class MediaControlsManager {
   /// Should be called when playback stops or screen is disposed.
   Future<void> clear() async {
     _metadataGeneration++;
+    _thumbPlaying = null;
+    _thumbCanPlayPause = _thumbCanPrevious = _thumbCanNext = false;
+    unawaited(_syncThumbButtons());
     try {
       await OsMediaControls.clear();
       _throttledUpdate.cancel();
@@ -287,6 +314,23 @@ class MediaControlsManager {
       appLogger.d('Media controls cleared');
     } catch (e) {
       appLogger.w('Failed to clear media controls', error: e);
+    }
+  }
+
+  Future<void> _syncThumbButtons() async {
+    if (defaultTargetPlatform != TargetPlatform.windows) return;
+    final state = (_thumbPlaying, _thumbCanPlayPause, _thumbCanPrevious, _thumbCanNext);
+    if (state == _lastThumbState) return;
+    _lastThumbState = state;
+    try {
+      await NativeWindowService.setThumbButtons(
+        playing: _thumbPlaying,
+        canPlayPause: _thumbCanPlayPause,
+        canPrevious: _thumbCanPrevious,
+        canNext: _thumbCanNext,
+      );
+    } catch (e) {
+      appLogger.w('Failed to update taskbar thumbnail buttons', error: e);
     }
   }
 

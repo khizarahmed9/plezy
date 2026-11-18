@@ -171,6 +171,31 @@ void main() {
     expect(calls[0].arguments, containsAll(['skipForward', 'skipBackward']));
   });
 
+  test('Windows taskbar thumbnail buttons follow play state and hide on clear', () async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    const windowChannel = MethodChannel('plezy/window');
+    final thumbCalls = <Object?>[];
+    final messenger = TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(windowChannel, (call) async {
+      if (call.method == 'setThumbButtons') thumbCalls.add(call.arguments);
+      return null;
+    });
+    addTearDown(() => messenger.setMockMethodCallHandler(windowChannel, null));
+    final manager = MediaControlsManager();
+    addTearDown(manager.dispose);
+
+    await manager.setControlsEnabled(canPlayPause: true, canGoNext: true);
+    await manager.updatePlaybackState(isPlaying: true, position: Duration.zero, speed: 1, force: true);
+    await manager.updatePlaybackState(isPlaying: true, position: const Duration(seconds: 1), speed: 1, force: true);
+    await manager.clear();
+
+    expect(thumbCalls, [
+      {'playing': null, 'canPlayPause': true, 'canPrevious': false, 'canNext': true},
+      {'playing': true, 'canPlayPause': true, 'canPrevious': false, 'canNext': true},
+      {'playing': null, 'canPlayPause': false, 'canPrevious': false, 'canNext': false},
+    ]);
+  });
+
   group('artwork', () {
     late AppDatabase db;
     late PlexClient client;
